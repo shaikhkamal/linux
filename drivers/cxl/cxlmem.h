@@ -812,6 +812,31 @@ int cxl_set_timestamp(struct cxl_memdev_state *mds);
 int cxl_poison_state_init(struct cxl_memdev_state *mds);
 int cxl_mem_get_poison(struct cxl_memdev *cxlmd, u64 offset, u64 len,
 		       struct cxl_region *cxlr);
+
+/**
+ * struct cxl_poison_snapshot - Aggregate Get Poison List result
+ * @records: Copied Media Error Records from all mailbox responses
+ * @nr_records: Number of valid records stored in @records
+ * @capacity: Maximum number of records that @records can hold
+ * @overflow_ts: Timestamp associated with a reported device overflow
+ * @device_flags: Persistent device status observed during collection
+ * @truncated: Host stopped before collecting all available records
+ */
+struct cxl_poison_snapshot {
+	struct cxl_poison_record *records;
+	u32 nr_records;
+	u32 capacity;
+	u64 overflow_ts;
+	u8 device_flags;
+	bool truncated;
+};
+
+int cxl_poison_snapshot_init(struct cxl_memdev *cxlmd,
+			     struct cxl_poison_snapshot *snapshot);
+void cxl_poison_snapshot_destroy(struct cxl_poison_snapshot *snapshot);
+int cxl_mem_get_poison_snapshot(struct cxl_memdev *cxlmd, u64 offset, u64 len,
+				struct cxl_region *cxlr,
+				struct cxl_poison_snapshot *snapshot);
 int cxl_trigger_poison_list(struct cxl_memdev *cxlmd);
 int cxl_inject_poison(struct cxl_memdev *cxlmd, u64 dpa);
 int cxl_clear_poison(struct cxl_memdev *cxlmd, u64 dpa);
