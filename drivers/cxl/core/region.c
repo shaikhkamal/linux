@@ -2940,6 +2940,40 @@ static int cxl_get_poison_unmapped(struct cxl_memdev *cxlmd,
 	return rc;
 }
 
+enum cxl_poison_query_policy {
+	CXL_POISON_QUERY_DIAGNOSTIC,
+	CXL_POISON_QUERY_PREONLINE,
+};
+
+static int cxl_get_poison_by_decoder(struct cxl_endpoint_decoder *cxled,
+				     struct cxl_poison_snapshot *snapshot,
+				     enum cxl_poison_query_policy policy)
+{
+	struct cxl_memdev *cxlmd = cxled_to_memdev(cxled);
+	struct cxl_dev_state *cxlds = cxlmd->cxlds;
+	enum cxl_partition_mode mode;
+	u64 offset, length;
+	int rc;
+
+	if (!cxled->dpa_res)
+		return 0;
+
+	mode = cxlds->part[cxled->part].mode;
+	offset = cxled->dpa_res->start;
+	length = resource_size(cxled->dpa_res);
+	if (snapshot)
+		rc = cxl_mem_get_poison_snapshot(cxlmd, offset, length,
+						 cxled->cxld.region, snapshot);
+	else
+		rc = cxl_mem_get_poison(cxlmd, offset, length,
+					cxled->cxld.region);
+
+	if (rc == -EFAULT && mode == CXL_PARTMODE_RAM &&
+	    policy == CXL_POISON_QUERY_DIAGNOSTIC)
+		rc = 0;
+	return rc;
+}
+
 static int poison_by_decoder(struct device *dev, void *arg)
 {
 	struct cxl_poison_context *ctx = arg;
@@ -2971,11 +3005,8 @@ static int poison_by_decoder(struct device *dev, void *arg)
 			return rc;
 	}
 
-	offset = cxled->dpa_res->start;
-	length = cxled->dpa_res->end - offset + 1;
-	rc = cxl_mem_get_poison(cxlmd, offset, length, cxled->cxld.region);
-	if (rc == -EFAULT && mode == CXL_PARTMODE_RAM)
-		rc = 0;
+	rc = cxl_get_poison_by_decoder(cxled, NULL,
+				       CXL_POISON_QUERY_DIAGNOSTIC);
 	if (rc)
 		return rc;
 
