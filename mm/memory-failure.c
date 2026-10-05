@@ -2291,6 +2291,181 @@ static void kill_procs_now(struct page *p, unsigned long pfn, int flags,
 	kill_procs(&tokill, true, pfn, flags);
 }
 
+/**
+ * struct preonline_hwpoison - Owner of pre-online poisoned PFN ranges
+ * @list: Entry in the global owner list
+ * @rcu: Used to defer the free past a grace period
+ * @nr_ranges: Number of ranges in @ranges
+ * @ranges: Sorted, nonoverlapping PFN ranges
+ *
+ * The ranges are immutable after the object is added to the owner list, which is
+ * what lets readers walk them under RCU with no lock.
+ */
+struct preonline_hwpoison {
+	struct list_head list;
+	struct rcu_head rcu;
+	unsigned int nr_ranges;
+	struct preonline_hwpoison_range ranges[];
+};
+
+static LIST_HEAD(preonline_hwpoison_owners);
+/* Serialises writers only. Readers use RCU. */
+static DEFINE_MUTEX(preonline_hwpoison_lock);
+
+static int
+preonline_hwpoison_validate(const struct preonline_hwpoison_range *ranges,
+			    unsigned int nr_ranges)
+{
+	unsigned long previous_end = 0;
+
+	if (!ranges || !nr_ranges)
+		return -EINVAL;
+
+	for (unsigned int i = 0; i < nr_ranges; i++) {
+		unsigned long end;
+
+		if (!ranges[i].nr_pages)
+			return -EINVAL;
+
+		if (check_add_overflow(ranges[i].start_pfn,
+				       ranges[i].nr_pages - 1, &end))
+			return -EOVERFLOW;
+
+		/*
+		 * Require sorted, nonoverlapping ranges. Adjacent ranges
+		 * remain valid, although callers may coalesce them to reduce
+		 * storage and lookup overhead.
+		 */
+		if (i && ranges[i].start_pfn <= previous_end)
+			return -EINVAL;
+
+		previous_end = end;
+	}
+
+	return 0;
+}
+
+int preonline_hwpoison_register(const struct preonline_hwpoison_range *ranges,
+				unsigned int nr_ranges,
+				struct preonline_hwpoison **handle)
+{
+	struct preonline_hwpoison *owner;
+	int rc;
+
+	if (!handle)
+		return -EINVAL;
+
+	*handle = NULL;
+
+	rc = preonline_hwpoison_validate(ranges, nr_ranges);
+	if (rc)
+		return rc;
+
+	/*
+	 * The range array may be larger than a page, so do not require
+	 * physically contiguous memory.
+	 */
+	owner = kvmalloc(struct_size(owner, ranges, nr_ranges), GFP_KERNEL);
+	if (!owner)
+		return -ENOMEM;
+
+	owner->nr_ranges = nr_ranges;
+	memcpy(owner->ranges, ranges,
+	       flex_array_size(owner, ranges, nr_ranges));
+
+	/*
+	 * list_add_tail_rcu() publishes with a release barrier, so a reader
+	 * that observes the entry also observes the fully initialised
+	 * ranges[] above.
+	 */
+	scoped_guard(mutex, &preonline_hwpoison_lock) {
+		list_add_tail_rcu(&owner->list, &preonline_hwpoison_owners);
+	}
+
+	*handle = owner;
+
+	return 0;
+}
+EXPORT_SYMBOL_GPL(preonline_hwpoison_register);
+
+void preonline_hwpoison_unregister(struct preonline_hwpoison *owner)
+{
+	if (!owner)
+		return;
+
+	scoped_guard(mutex, &preonline_hwpoison_lock) {
+		list_del_rcu(&owner->list);
+	}
+
+	/*
+	 * A reader may still be walking this entry. list_del_rcu() leaves its
+	 * forward pointer intact so that walk completes into the live list;
+	 * the free waits for a grace period.
+	 */
+	kvfree_rcu(owner, rcu);
+}
+EXPORT_SYMBOL_GPL(preonline_hwpoison_unregister);
+
+static bool preonline_owner_intersects(const struct preonline_hwpoison *owner,
+				       unsigned long start_pfn,
+				       unsigned long end_pfn)
+{
+	unsigned int low = 0;
+	unsigned int high = owner->nr_ranges;
+
+	/*
+	 * Find the first range whose inclusive end is greater than or equal
+	 * to start_pfn.
+	 */
+	while (low < high) {
+		const struct preonline_hwpoison_range *range;
+		unsigned long range_end;
+		unsigned int mid;
+
+		mid = low + (high - low) / 2;
+		range = &owner->ranges[mid];
+		range_end = range->start_pfn + range->nr_pages - 1;
+
+		if (range_end < start_pfn)
+			low = mid + 1;
+		else
+			high = mid;
+	}
+
+	if (low == owner->nr_ranges)
+		return false;
+
+	return owner->ranges[low].start_pfn <= end_pfn;
+}
+
+bool preonline_hwpoison_intersects(unsigned long start_pfn,
+				   unsigned long nr_pages)
+{
+	struct preonline_hwpoison *owner;
+	unsigned long end_pfn;
+
+	if (!nr_pages)
+		return false;
+
+	/* Fail safe: withhold a range we cannot reason about. */
+	if (WARN_ON_ONCE(check_add_overflow(start_pfn, nr_pages - 1, &end_pfn)))
+		return true;
+
+	guard(rcu)();
+
+	list_for_each_entry_rcu(owner, &preonline_hwpoison_owners, list) {
+		if (preonline_owner_intersects(owner, start_pfn, end_pfn))
+			return true;
+	}
+
+	return false;
+}
+
+bool preonline_hwpoison_contains(unsigned long pfn)
+{
+	return preonline_hwpoison_intersects(pfn, 1);
+}
+
 int register_pfn_address_space(struct pfn_address_space *pfn_space)
 {
 	guard(mutex)(&pfn_space_lock);
