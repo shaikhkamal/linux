@@ -33,6 +33,7 @@
 #include <linux/cpuset.h>
 #include <linux/folio_batch.h>
 #include <linux/memory_hotplug.h>
+#include <linux/memory-failure.h>
 #include <linux/nodemask.h>
 #include <linux/vmstat.h>
 #include <linux/fault-inject.h>
@@ -1601,12 +1602,14 @@ static void __meminit free_poisoned_block(struct page *page, unsigned int order,
 					  enum meminit_context context)
 {
 	unsigned long i, nr_pages = 1UL << order;
+	unsigned long pfn = page_to_pfn(page);
 
 	for (i = 0; i < nr_pages; i++) {
 		struct page *p = page + i;
 		phys_addr_t phys = page_to_phys(p);
 
-		if (range_contains_poisoned_memory(phys, PAGE_SIZE)) {
+		if (range_contains_poisoned_memory(phys, PAGE_SIZE) ||
+		    preonline_hwpoison_contains(pfn + i)) {
 			hwpoison_boot_page(p, context);
 			continue;
 		}
@@ -1652,7 +1655,8 @@ void __meminit __free_pages_core(struct page *page, unsigned int order,
 
 	/* First: a block parked by __free_unaccepted() never returns here. */
 	if (range_contains_poisoned_memory(page_to_phys(page),
-					   PAGE_SIZE << order)) {
+					   PAGE_SIZE << order) ||
+	    preonline_hwpoison_intersects(page_to_pfn(page), nr_pages)) {
 		free_poisoned_block(page, order, context);
 		return;
 	}
