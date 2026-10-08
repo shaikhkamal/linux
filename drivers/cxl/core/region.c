@@ -14,6 +14,7 @@
 #include <linux/string_choices.h>
 #include <cxlmem.h>
 #include <cxl.h>
+#include <linux/memory-failure.h>
 #include "core.h"
 #include "mce.h"
 
@@ -3038,6 +3039,323 @@ int cxl_get_poison_by_endpoint(struct cxl_port *port)
 	return rc;
 }
 
+/*
+ * Device-reported poison is gathered at RAM-region probe, before the range
+ * reaches dax/kmem, and registered with the pre-online registry so the
+ * frames it covers are withheld when the memory is onlined.
+ */
+static int cxl_poison_store_pfn(struct xarray *pfns, u64 hpa)
+{
+	return xa_err(xa_store(pfns, PHYS_PFN(hpa), xa_mk_value(1),
+			GFP_KERNEL));
+}
+
+static int cxl_poison_store_hpa(struct cxl_region *cxlr, struct xarray *pfns,
+				u64 hpa)
+{
+	struct cxl_region_params *p = &cxlr->params;
+	int rc;
+
+	/* Outside this region: not ours to withhold. */
+	if (!cxl_resource_contains_addr(p->res, hpa))
+		return -ERANGE;
+
+	rc = cxl_poison_store_pfn(pfns, hpa);
+	if (rc || !p->cache_size)
+		return rc;
+
+	/*
+	 * An extended linear cache makes the same DPA visible a second time
+	 * at hpa - cache_size. Match the translation used by the
+	 * cxl_general_media and cxl_dram trace events.
+	 */
+	if (WARN_ON_ONCE(hpa < p->res->start + p->cache_size))
+		return -ERANGE;
+
+	return cxl_poison_store_pfn(pfns, hpa - p->cache_size);
+}
+
+static int cxl_poison_record_to_pfns(struct cxl_region *cxlr,
+				     struct cxl_memdev *cxlmd,
+				     const struct cxl_poison_record *record,
+				     struct xarray *pfns)
+{
+	struct cxl_region_params *p = &cxlr->params;
+	u64 raw = le64_to_cpu(record->address);
+	u64 units = le32_to_cpu(record->length);
+	u64 dpa = raw & CXL_POISON_START_MASK;
+	u8 source = raw & CXL_POISON_SOURCE_MASK;
+	u64 length, end, step, cur;
+
+	if (!units ||
+	    check_mul_overflow(units, (u64)CXL_POISON_LEN_MULT, &length) ||
+	    check_add_overflow(dpa, length, &end))
+		return -EPROTO;
+
+	/*
+	 * A corrected error never reaches the poison list, so every record
+	 * is uncorrectable. Only a failure of the device's own media is
+	 * withheld: External poison was written by the host into healthy
+	 * media and a rewrite or Clear Poison recovers it, and Injected
+	 * poison is a test artifact. Withholding either would make a
+	 * recoverable state permanent.
+	 */
+	if (source != CXL_POISON_SOURCE_INTERNAL) {
+		dev_dbg(&cxlr->dev, "%s: dpa %#llx source %u not withheld\n",
+			dev_name(&cxlmd->dev), dpa, source);
+		return 0;
+	}
+
+	/*
+	 * Translate once per unit of HPA contiguity rather than per 64
+	 * bytes. Consecutive DPAs within an interleave granule map to
+	 * consecutive HPAs, and a granule no larger than a page lies within
+	 * one page, so stepping by min(granule, PAGE_SIZE) from an aligned
+	 * start reaches every page the record covers.
+	 */
+	step = clamp_t(u64, p->interleave_granularity, CXL_POISON_LEN_MULT,
+		       PAGE_SIZE);
+
+	for (cur = ALIGN_DOWN(dpa, step); cur < end; cur += step) {
+		u64 hpa = cxl_dpa_to_hpa(cxlr, cxlmd, max(cur, dpa));
+		int rc;
+
+		/* Not mapped by this region; nothing here to withhold. */
+		if (hpa == ULLONG_MAX)
+			continue;
+
+		rc = cxl_poison_store_hpa(cxlr, pfns, hpa);
+		if (rc)
+			return rc;
+	}
+
+	return 0;
+}
+
+static int cxl_region_collect_decoder_poison(struct cxl_region *cxlr,
+					     struct cxl_endpoint_decoder *cxled,
+					     struct xarray *pfns)
+{
+	struct cxl_memdev *cxlmd = cxled_to_memdev(cxled);
+	struct cxl_poison_snapshot snapshot;
+	int rc;
+
+	rc = cxl_poison_snapshot_init(cxlmd, &snapshot);
+	if (rc == -EOPNOTSUPP) {
+		dev_info(&cxlr->dev,
+			 "%s: no Get Poison List support, nothing withheld\n",
+			 dev_name(&cxlmd->dev));
+		return 0;
+	}
+	if (rc)
+		return rc;
+
+	rc = cxl_get_poison_by_decoder(cxled, &snapshot,
+				       CXL_POISON_QUERY_PREONLINE);
+	if (rc == -EFAULT) {
+		/*
+		 * The device keeps no poison list for volatile ranges, which
+		 * CXL r3.2 8.2.9.8.4.1 permits. Online the region as today.
+		 */
+		dev_info(&cxlr->dev,
+			 "%s: no volatile poison list, nothing withheld\n",
+			 dev_name(&cxlmd->dev));
+		rc = 0;
+		goto out;
+	}
+	if (rc)
+		goto out;
+
+	/*
+	 * Withholding from a partial list would online the region on the
+	 * belief that every bad frame had been named.
+	 */
+	if (snapshot.truncated ||
+	    (snapshot.device_flags & CXL_POISON_FLAG_OVERFLOW)) {
+		dev_err(&cxlr->dev, "%s: poison list incomplete\n",
+			dev_name(&cxlmd->dev));
+		rc = -EOVERFLOW;
+		goto out;
+	}
+	if (snapshot.device_flags & CXL_POISON_FLAG_SCANNING) {
+		dev_err(&cxlr->dev, "%s: media scan in progress\n",
+			dev_name(&cxlmd->dev));
+		rc = -EBUSY;
+		goto out;
+	}
+
+	for (u32 i = 0; i < snapshot.nr_records; i++) {
+		rc = cxl_poison_record_to_pfns(cxlr, cxlmd,
+					       &snapshot.records[i], pfns);
+		if (rc)
+			break;
+	}
+out:
+	cxl_poison_snapshot_destroy(&snapshot);
+	return rc;
+}
+
+static unsigned int cxl_count_poison_ranges(struct xarray *pfns)
+{
+	unsigned long index, previous = 0;
+	unsigned int nr = 0;
+	void *entry;
+	bool first = true;
+
+	xa_for_each(pfns, index, entry) {
+		if (first || index != previous + 1)
+			nr++;
+		first = false;
+		previous = index;
+	}
+	return nr;
+}
+
+/*
+ * The xarray holds each PFN once and xa_for_each() walks them in ascending
+ * order, so runs of consecutive indices are exactly the sorted,
+ * nonoverlapping ranges preonline_hwpoison_register() requires.
+ */
+static int cxl_pfns_to_ranges(struct xarray *pfns,
+			      struct preonline_hwpoison_range **ranges_out,
+			      unsigned int *nr_ranges_out)
+{
+	struct preonline_hwpoison_range *ranges;
+	unsigned long index, previous = 0, run_start = 0;
+	unsigned int nr_ranges, nr = 0;
+	void *entry;
+	bool first = true;
+
+	nr_ranges = cxl_count_poison_ranges(pfns);
+	if (!nr_ranges) {
+		*ranges_out = NULL;
+		*nr_ranges_out = 0;
+		return 0;
+	}
+
+	ranges = kvmalloc_array(nr_ranges, sizeof(*ranges), GFP_KERNEL);
+	if (!ranges)
+		return -ENOMEM;
+
+	xa_for_each(pfns, index, entry) {
+		if (first) {
+			run_start = index;
+			previous = index;
+			first = false;
+			continue;
+		}
+		if (index == previous + 1) {
+			previous = index;
+			continue;
+		}
+		ranges[nr++] = (struct preonline_hwpoison_range) {
+			.start_pfn = run_start,
+			.nr_pages = previous - run_start + 1,
+		};
+		run_start = index;
+		previous = index;
+	}
+	ranges[nr++] = (struct preonline_hwpoison_range){
+		.start_pfn = run_start,
+		.nr_pages = previous - run_start + 1,
+	};
+
+	WARN_ON_ONCE(nr != nr_ranges);
+	*ranges_out = ranges;
+	*nr_ranges_out = nr;
+	return 0;
+}
+
+static void cxl_unregister_device_poison(void *data)
+{
+	preonline_hwpoison_unregister(data);
+}
+
+static int cxl_region_register_device_poison(struct cxl_region *cxlr)
+{
+	struct cxl_region_params *p = &cxlr->params;
+	struct preonline_hwpoison_range *ranges = NULL;
+	struct preonline_hwpoison *handle;
+	unsigned int nr_ranges = 0;
+	unsigned long nr_frames = 0;
+	struct xarray pfns;
+	int rc = 0;
+
+	lockdep_assert_held(&cxl_rwsem.region);
+	lockdep_assert_held(&cxl_rwsem.dpa);
+
+	/* The region may have been decommitted while the lock was dropped. */
+	if (p->state < CXL_CONFIG_COMMIT)
+		return -ENXIO;
+
+	if (test_bit(CXL_REGION_F_NORMALIZED_ADDRESSING, &cxlr->flags)) {
+		dev_info(&cxlr->dev,
+			 "normalized addressing, poison not translated\n");
+		return 0;
+	}
+
+	xa_init(&pfns);
+
+	for (int i = 0; i < p->nr_targets; i++) {
+		struct cxl_endpoint_decoder *cxled = p->targets[i];
+
+		if (!cxled->dpa_res || !resource_size(cxled->dpa_res))
+			continue;
+		rc = cxl_region_collect_decoder_poison(cxlr, cxled, &pfns);
+		if (rc)
+			goto out;
+	}
+
+	if (xa_empty(&pfns))
+		goto out;
+
+	rc = cxl_pfns_to_ranges(&pfns, &ranges, &nr_ranges);
+	if (rc)
+		goto out;
+
+	rc = preonline_hwpoison_register(ranges, nr_ranges, &handle);
+	if (rc == -EOPNOTSUPP) {
+		/* No poison tracking in this kernel; nothing to withhold. */
+		rc = 0;
+		goto out;
+	}
+	if (rc)
+		goto out;
+
+	for (unsigned int i = 0; i < nr_ranges; i++)
+		nr_frames += ranges[i].nr_pages;
+	dev_warn(&cxlr->dev,
+		 "withholding %lu frame(s) reported poisoned by the device\n",
+		 nr_frames);
+
+	rc = devm_add_action_or_reset(&cxlr->dev, cxl_unregister_device_poison,
+				      handle);
+out:
+	kvfree(ranges);
+	xa_destroy(&pfns);
+	return rc;
+}
+
+static int cxl_region_scan_device_poison(struct cxl_region *cxlr)
+{
+	int rc;
+
+	/* Nothing would consume the result. */
+	if (!IS_ENABLED(CONFIG_MEMORY_FAILURE))
+		return 0;
+
+	ACQUIRE(rwsem_read_intr, region_rwsem)(&cxl_rwsem.region);
+	rc = ACQUIRE_ERR(rwsem_read_intr, &region_rwsem);
+	if (rc)
+		return rc;
+	ACQUIRE(rwsem_read_intr, dpa_rwsem)(&cxl_rwsem.dpa);
+	rc = ACQUIRE_ERR(rwsem_read_intr, &dpa_rwsem);
+	if (rc)
+		return rc;
+
+	return cxl_region_register_device_poison(cxlr);
+}
+
 struct cxl_dpa_to_region_context {
 	struct cxl_region *cxlr;
 	u64 dpa;
@@ -4262,6 +4580,10 @@ static int cxl_region_probe(struct device *dev)
 					p->res->start, p->res->end, cxlr,
 					is_system_ram) > 0)
 			return 0;
+		rc = cxl_region_scan_device_poison(cxlr);
+		if (rc)
+			return rc;
+
 		return devm_cxl_add_dax_region(cxlr);
 	default:
 		dev_dbg(&cxlr->dev, "unsupported region mode: %d\n",
